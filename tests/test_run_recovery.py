@@ -1,0 +1,579 @@
+"""Run lifecycle failures must preserve accepted work and report honest status."""
+
+from dataclasses import replace
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from backcountry.harness.cli import _output_paths, _run_lock
+from backcountry.harness.loop import JobRunner
+from backcountry.harness.log import RunLog
+from backcountry.harness.report import Report
+from backcountry.harness.bind.emit import EmittedWrapper
+from backcountry.harness.manifest import FinalBenchmark
+from backcountry_runtime.kernels import KernelSpec
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def bare_runner(tmp_path):
+    runner = object.__new__(JobRunner)
+    runner.work_dir = tmp_path
+    runner.report = Report()
+    runner.log = RunLog(tmp_path / "run.jsonl")
+    runner.session = SimpleNamespace(memory=lambda where, **detail: {})
+    runner.final_ok = False
+    runner.shipped_tags = {}
+    runner.emitted = {}
+    runner._compiled_baseline = runner.baseline_model = None
+    runner._resume_state = runner._search_state = None  # a fresh job, not a resumed one
+    runner.installed = {}
+    # what a checkpoint's bundle reads: the model file, the baseline, the traced inputs
+    runner.manifest = SimpleNamespace(model_path=FIXTURES / "planted_win.py", workloads=(),
+                                      final_benchmark=FinalBenchmark(), tolerances=None,
+                                      tolerance_allowed=True)
+    runner.baseline = "plain"
+    runner.tensors, runner.sweep_tensors = {}, {}
+    runner.context = None  # no context workload; set by __init__ in a real run
+    runner.context_seed = runner.context_tokens = None
+    return runner
+
+
+def test_judge_readiness_failure_prevents_runner_creation(tmp_path, monkeypatch, capsys):
+    import argparse
+    from backcountry.harness import cli, loop
+    from backcountry.harness.judge.agent import CliJudge
+
+    def fail(self):
+        raise ValueError("OAuth expired; run claude auth login")
+    monkeypatch.setattr(CliJudge, "check_available", fail)
+    monkeypatch.setattr(loop, "JobRunner", lambda *a, **k: pytest.fail("model runner started"))
+    args = SimpleNamespace(judge_cmd=None, judge="claude-cli", judge_effort=None, model=None, work_dir=tmp_path)
+    with pytest.raises(SystemExit) as error:
+        cli._execute(args, argparse.ArgumentParser())
+    assert error.value.code == 2
+    assert "claude auth login" in capsys.readouterr().err
+
+
+def test_dead_judge_pauses_job_and_preserves_accepted_work(tmp_path):
+    from backcountry.harness.loop import RegionRun
+    runner = bare_runner(tmp_path)
+    runner.tracer = SimpleNamespace(uninstall=lambda: None)
+    runner.total_hypotheses = 0
+    runner.report.accepted = [{"kernel": "previous_win"}]
+    checkpoint = tmp_path / "checkpoints" / "accepted.metal"
+    checkpoint.parent.mkdir()
+    checkpoint.write_text("saved kernel")
+    run = RegionRun(SimpleNamespace(fingerprint="target"))
+    runner._record_empty = lambda *a: "empty"
+    def search():
+        for _ in range(3):
+            runner._empty_reply(run, None, "CLI login expired", None, None)
+        pytest.fail("continued search with unavailable judge")
+    runner._run = search
+    runner.run()  # a pause is an outcome, not a failure: resume asks the judge again
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["session"]["status"] == "paused" and "did not answer" in report["session"]["reason"]
+    assert report["accepted"] == [{"kernel": "previous_win"}]
+    assert checkpoint.read_text() == "saved kernel"
+    assert runner.total_hypotheses == run.hypotheses == 0
+
+
+def test_successful_reply_resets_connection_failure_streak(tmp_path):
+    from backcountry.harness.loop import RegionRun
+    from backcountry.harness.judge.schema import JudgeBabble
+    runner = bare_runner(tmp_path)
+    run = RegionRun(SimpleNamespace(fingerprint="target"), errors=2)
+    reply = SimpleNamespace(queue=[])
+    assert runner._ask_judge(run, "seed", lambda: reply) == (reply, None)
+    assert run.errors == 0
+    run.errors = 2
+    def malformed():
+        raise JudgeBabble("not JSON")
+    assert runner._ask_judge(run, "seed", malformed) == (None, "babble")
+    assert run.errors == 0
+
+
+def test_checkpoint_preserves_exact_code_and_model_measurements(tmp_path):
+    runner = bare_runner(tmp_path)
+    spec = KernelSpec("accepted", "accepted", ("in0",), ("out0",), "out0[0] = in0[0];")
+    wrapper = EmittedWrapper("Saved", "layer", "class Saved: pass\n", [], ["accepted"])
+    runner.model = SimpleNamespace(layer=SimpleNamespace(_specs={"accepted": spec}))
+    runner.emitted = {"layer": wrapper}
+    accepted = {"kernel": "accepted", "timings": {"main": {"median_ratio": 0.97}}}
+    saved = runner._save_checkpoint(accepted)
+    assert (saved / "kernels/accepted.metal").read_text() == spec.source
+    assert wrapper.source in (saved / "patch/wrappers.py").read_text()
+    report = json.loads((saved / "report.json").read_text())
+    assert report["accepted"][0]["timings"] == accepted["timings"]
+    assert report["session"]["status"] == "accepted_checkpoint"
+    assert report["session"]["artifact_validation"] == "pending"
+    assert runner.report.accepted == []  # saving does not commit live model state
+    runner.report.accepted.append(accepted)
+    second = runner._save_checkpoint({**accepted, "kernel": "next"})
+    assert second != saved and (saved / "apply.py").exists()
+    # a job resumed after a crash may not know `second` was saved: it must not overwrite it
+    third = runner._save_checkpoint({**accepted, "kernel": "after resume"})
+    assert third.name == "accepted-0003" and "next" in (second / "report.json").read_text()
+    # a checkpoint is a whole bundle too: the model source travels with the code
+    assert (saved / "model" / "tests" / "fixtures" / "planted_win.py").exists()
+    assert json.loads((saved / "bundle.json").read_text())["patches"] == [
+        {"module_path": "layer", "kernel_ids": ["accepted"]}]
+
+
+@pytest.mark.parametrize("error", [RuntimeError("fresh-process mismatch"), KeyboardInterrupt()])
+def test_export_failure_records_status_and_preserves_checkpoint(tmp_path, monkeypatch, error):
+    runner = bare_runner(tmp_path)
+    checkpoint = tmp_path / "checkpoints/accepted-0001"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "keep").write_text("accepted code")
+    def fail(path):
+        raise error
+    monkeypatch.setattr(runner, "_emit_artifact", fail)
+    with pytest.raises(type(error)):
+        runner.emit_artifact(tmp_path / "artifact")
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["session"]["status"] == ("interrupted" if isinstance(error, KeyboardInterrupt) else "failed")
+    assert (checkpoint / "keep").read_text() == "accepted code"
+    assert runner.log.rows()[-1]["kind"] == "job_failed"
+
+
+def test_export_cannot_run_before_final_check(tmp_path):
+    runner = bare_runner(tmp_path)
+    with pytest.raises(RuntimeError, match="final whole-model check"):
+        runner.emit_artifact(tmp_path / "artifact")
+    assert not (tmp_path / "artifact").exists()
+
+
+def test_export_success_updates_both_reports(tmp_path, monkeypatch):
+    runner = bare_runner(tmp_path)
+    out = tmp_path / "artifact"
+    out.mkdir()
+    (out / "swap_table.json").write_text("[]\n")  # as every export writes it
+    monkeypatch.setattr(runner, "_emit_artifact", lambda path: out)
+    assert runner.emit_artifact(out) == out
+    for path in [tmp_path / "report.json", out / "report.json"]:
+        assert json.loads(path.read_text())["session"]["status"] == "complete"
+
+
+def test_default_artifact_is_scoped_to_run(tmp_path):
+    assert _output_paths(tmp_path / "work", None) == tmp_path / "work/artifact"
+
+
+@pytest.mark.usefixtures("unused_manifest")
+def test_missing_judge_is_refused_before_model_load(tmp_path, monkeypatch):
+    from backcountry.harness.cli import main
+    monkeypatch.setattr("backcountry.harness.judge.agent.shutil.which", lambda command: None)
+    with pytest.raises(SystemExit) as error:
+        main(["run", "unused.yaml", "--work-dir", str(tmp_path / "work"),
+              "--judge", "claude-cli"])
+    assert error.value.code == 2
+    assert not (tmp_path / "work").exists()
+
+
+@pytest.mark.parametrize("installed,ratio,confirmed", [(False, 0.98, False),
+                                                      (True, 1.0, False), (True, 0.98, True)])
+def test_final_clock_does_not_call_an_unchanged_model_a_win(tmp_path, installed, ratio, confirmed):
+    from backcountry.harness.measure.clocks import comparison_from_samples
+    runner = bare_runner(tmp_path)
+    runner.installed = {"layer": object()} if installed else {}
+    clock = comparison_from_samples([100.0] * 10, [100.0 * ratio] * 10)
+    runner._record_final_clock("main", clock)
+    assert runner.report.step_ms["main"]["win_confirmed"] is confirmed
+    assert runner.log.rows()[-1]["win_confirmed"] is confirmed
+
+
+@pytest.mark.usefixtures("unused_manifest")
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_cli_summary_requires_explicit_confirmation(tmp_path, monkeypatch, capsys, confirmed):
+    from backcountry.harness.cli import main
+
+    report = Report(baseline={"choice": "plain"}, step_ms={"main": {
+        "speedup": 1.02, "after": 98.0, "baseline_at_end": 100.0,
+        "stability": 0.99, "win_confirmed": confirmed,
+        "sequence_speedup": 1.03, "sequence_win_confirmed": confirmed}},
+        final={"sequences": {"main": {"steps": 20, "candidate_sequence_ms": 1940.0,
+                                      "baseline_sequence_ms": 2000.0}}})
+    def fake_runner(*args, **kwargs):
+        Path(args[1]).mkdir(parents=True, exist_ok=True)
+        return SimpleNamespace(run=lambda: report, emit_artifact=lambda path: path)
+    monkeypatch.setattr("backcountry.harness.loop.JobRunner", fake_runner)
+    monkeypatch.setattr("backcountry.harness.judge.agent.CliJudge.check_available", lambda self: None)
+    assert main(["run", "unused.yaml", "--work-dir", str(tmp_path / "work"),
+                 "--judge", "claude-cli"]) == 0
+    message = capsys.readouterr().out
+    if confirmed:
+        assert "1.020x confirmed speedup" in message
+        assert "20 repeated forward passes: patched 1940.0 ms vs untouched 2000.0 ms" in message
+        assert "1.030x confirmed speedup" in message
+    else:
+        assert message.count("no confirmed speedup") == 2
+        assert "1.020x" not in message and "1.030x" not in message
+
+
+def test_pricing_report_keeps_rejected_region_and_largest_share(tmp_path, monkeypatch):
+    from backcountry.harness import loop
+    from backcountry.harness.regions.types import Region, Stretch, Roofline
+    from backcountry.harness.regions.price import RegionPrice
+    runner = bare_runner(tmp_path)
+    runner.manifest = SimpleNamespace(workloads=[SimpleNamespace(name="main")], tolerance_allowed=True)
+    runner.model, runner.session, runner.store, runner.peaks = None, None, None, None
+    runner.session = SimpleNamespace(wait_ready=lambda: None, memory=lambda where, **detail: {})
+    runner.tensors, runner.traces, runner.step_ms = {"main": []}, {"main": None}, {"main": 100}
+    runner.baseline, runner.selection_wave = "plain", 1
+    runner._step_fn = lambda *a: None
+    runner._atomic = lambda r: True
+    monkeypatch.setattr(loop, "price_group", lambda *a, **kw: None)
+    monkeypatch.setattr(loop, "capture_instances", lambda r, traces: [("main", r.members[0], 1)])
+    monkeypatch.setattr(loop, "stretch_roofline", lambda *a, **kw: Roofline(1, 1, 1, 1, "compute", 1.1))
+    regions = []
+    for name, share in [("small", 0.01), ("large", 0.516)]:
+        r = Region(name, ("mx.exp",), [Stretch("main", 0, 0, (0,), (1,), ())])
+        r.p = {"main": share}
+        r.t_rep_ms = r.t_orig_ms = {"main": share * 100}
+        r.prices = {"main": RegionPrice(share, share * 100, 1.0, 1.0)}
+        regions.append(r)
+    assert [r.fingerprint for r in runner._price_and_rank(regions)] == ["large"]
+    rows = json.loads((tmp_path / "report.json").read_text())["pricing"]
+    assert rows[0]["p"] == {"main": 0.516}
+    assert rows[1]["status"] == "rejected" and "under floor" in rows[1]["reason"]
+
+
+@pytest.mark.parametrize("destination", ["work", ".", "work/kernels", "work/kernels/nested",
+                                        "work/checkpoints", "work/report.json"])
+def test_artifact_cannot_replace_run_files(tmp_path, destination):
+    with pytest.raises(ValueError):
+        _output_paths(tmp_path / "work", tmp_path / destination)
+
+
+def test_existing_artifact_and_partial_work_are_refused(tmp_path):
+    out = tmp_path / "artifact"
+    out.mkdir()
+    (out / "keep").write_text("previous result")
+    with pytest.raises(ValueError, match="already exists"):
+        _output_paths(tmp_path / "work", out)
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "partial").write_text("interrupted preparation")
+    with pytest.raises(ValueError, match="not empty"):
+        _output_paths(work, None)
+
+
+def test_cli_lock_rejects_concurrent_run_and_releases_after_exception():
+    with pytest.raises(ValueError, match="interrupted"):
+        with _run_lock():
+            with pytest.raises(RuntimeError, match="another backcountry job"):
+                with _run_lock():
+                    pytest.fail("second run entered")
+            raise ValueError("interrupted")
+    with _run_lock():
+        pass
+
+
+def test_post_export_report_failure_is_recorded(tmp_path, monkeypatch):
+    runner = bare_runner(tmp_path)
+    out = tmp_path / 'artifact'
+    out.mkdir()
+    (out / 'keep').write_text('validated artifact')
+    monkeypatch.setattr(runner, '_emit_artifact', lambda path: out)
+    write = runner.report.write
+    def fail_artifact_report(path):
+        if Path(path) == out / 'report.json':
+            raise OSError('report write failed')
+        return write(path)
+    monkeypatch.setattr(runner.report, 'write', fail_artifact_report)
+    with pytest.raises(OSError, match='report write failed'):
+        runner.emit_artifact(out)
+    assert (out / 'keep').exists()
+    assert json.loads((tmp_path / 'report.json').read_text())['session']['status'] == 'failed'
+    assert runner.log.rows()[-1]['kind'] == 'job_failed'
+
+
+def test_first_changing_checkpoint_keeps_tolerance_policy_before_tag_commit(tmp_path):
+    import mlx.core as mx
+    runner = bare_runner(tmp_path)
+    runner.model = SimpleNamespace()
+    runner.emitted = {}
+    runner._compiled_baseline = None
+    runner.shipped_tags = {}  # accepting this first changing edit has not committed yet
+    runner.tensors = {'main': [mx.array([1.0])]}
+    runner.sweep_tensors = {'sweep': [mx.array([2.0])]}
+    runner.manifest.tolerances = (0.001, 0.00001)
+    saved = runner._save_checkpoint({'kernel': 'changing', 'assoc_tag': 'changing'})
+    meta = json.loads((saved / 'bundle.json').read_text())
+    assert meta['correctness_rule'] == 'baseline_tolerance'
+    assert not meta['goldens']
+    assert meta['tolerances'] == {'rtol': 0.001, 'atol': 0.00001}
+    assert set(meta['workloads']) == {'main', 'sweep'}
+    assert runner.shipped_tags == {}
+
+
+def test_exact_policy_follows_accepted_edits_and_pending_candidate(tmp_path):
+    runner = bare_runner(tmp_path)
+    runner.traces = {}  # model op types are irrelevant to its numeric policy
+    assert runner._requires_exact()
+    assert runner._requires_exact("preserving")
+    assert not runner._requires_exact("changing")
+    runner.shipped_tags = {"prior": "changing"}
+    assert not runner._requires_exact("preserving")
+    assert runner._requires_exact("preserving", "prior")
+    assert not runner._requires_exact("preserving", "another_region")
+
+
+def test_a_model_that_does_not_repeat_bit_for_bit_grades_every_edit_within_the_tolerance(tmp_path):
+    # Kokoro (mlx-audio) gives the same audio to within 1e-7, not bit for bit:
+    # with tolerance allowed there are no exact bits to preserve (2026-11-15)
+    runner = bare_runner(tmp_path)
+    runner.traces = {}
+    assert runner._requires_exact("preserving")
+    runner.report.constants["output_repeats"] = False
+    assert not runner._requires_exact() and not runner._requires_exact("preserving")
+    runner.manifest.tolerance_allowed = False   # 'tolerance: exact' stays exact
+    assert runner._requires_exact("preserving")
+
+
+def test_custom_region_pricing_uses_boundary_probe(tmp_path, monkeypatch):
+    from backcountry.harness import loop
+    from backcountry.harness.regions.types import Region, Stretch, Roofline
+    from backcountry.harness.regions.price import RegionPrice
+    runner = bare_runner(tmp_path)
+    runner.manifest = SimpleNamespace(workloads=[SimpleNamespace(name="main")], tolerance_allowed=True)
+    runner.model = runner.session = runner.store = runner.peaks = None
+    runner.session = SimpleNamespace(wait_ready=lambda: None, memory=lambda where, **detail: {})
+    runner.tensors, runner.traces, runner.step_ms = {"main": []}, {"main": None}, {"main": 100}
+    runner.selection_wave = 1
+    runner._step_fn = lambda *a: None
+    runner._atomic = lambda r: True
+    monkeypatch.setattr(loop, "price_group", lambda *a, **kw: None)
+    monkeypatch.setattr(loop, "capture_instances", lambda r, traces: [("main", r.members[0], 1)])
+    floors = []
+    def roof(*args, **kwargs):
+        floors.append(kwargs["floor_ms"])
+        return Roofline(1, 0, .001, kwargs["floor_ms"], "memory", 5)
+    monkeypatch.setattr(loop, "stretch_roofline", roof)
+    region = Region("custom", ("metal_kernel",), [Stretch("main", 0, 0, (0,), (1,), ())])
+    region.p = {"main": .10}
+    region.t_rep_ms = region.t_orig_ms = {"main": 10.0}
+    region.prices = {"main": RegionPrice(share=.10, ms=10.0, floor_ms=2.0, stability=1.0)}
+    assert runner._price_and_rank([region]) == [region]
+    assert floors == [2.0]
+    assert region.removable_p["main"] == pytest.approx(.08)
+    row = runner.report.pricing[0]
+    assert row["ranking_basis"] == "estimated_removable_share"
+    assert row["compute_model_complete"] is False
+
+
+@pytest.mark.usefixtures("unused_manifest")
+def test_no_win_cli_finishes_without_packaging(tmp_path, monkeypatch):
+    from backcountry.harness.cli import main
+    report = Report()
+    work = tmp_path / "work"
+    def fake_runner(*args, **kwargs):
+        work.mkdir()
+        def forbidden(path):
+            raise AssertionError("no-win run tried to package a model")
+        return SimpleNamespace(run=lambda: report, emit_artifact=forbidden)
+    monkeypatch.setattr("backcountry.harness.loop.JobRunner", fake_runner)
+    monkeypatch.setattr("backcountry.harness.judge.agent.CliJudge.check_available", lambda self: None)
+    assert main(["run", "unused.yaml", "--work-dir", str(work), "--judge", "claude-cli"]) == 0
+    saved = json.loads((work / "report.json").read_text())
+    assert saved["session"]["status"] == "complete"
+    assert saved["session"]["outcome"] == "no_improvement"
+    assert saved["session"]["artifact"] is None
+
+
+@pytest.mark.usefixtures("unused_manifest")
+@pytest.mark.parametrize("accepted,confirmed", [(False, False), (True, False), (True, True)])
+def test_cli_reports_export_outcome(tmp_path, monkeypatch, capsys, accepted, confirmed):
+    from backcountry.harness.cli import main
+    report = Report(regions=[{"s": 1.2}] if accepted else [])
+    if accepted:
+        report.accepted.append({"region": "example"})
+    work = tmp_path / "work"
+    def fake_runner(*args, **kwargs):
+        work.mkdir()
+        def export(path):
+            assert confirmed
+            path.mkdir()
+            return path
+        return SimpleNamespace(run=lambda: report, final_ok=confirmed, emit_artifact=export)
+    monkeypatch.setattr("backcountry.harness.loop.JobRunner", fake_runner)
+    monkeypatch.setattr("backcountry.harness.judge.agent.CliJudge.check_available", lambda self: None)
+    assert main(["run", "unused.yaml", "--work-dir", str(work), "--judge", "claude-cli"]) == 0
+    message = capsys.readouterr().out
+    if confirmed:
+        assert "verified artifact with 1/1 regions optimized" in message
+        assert f"artifact: {work / 'artifact'}" in message
+    else:
+        assert "no confirmed improvement; no artifact produced" in message
+        assert "regions optimized" not in message
+        assert ("Search accepted candidates" in message) == accepted
+
+
+@pytest.mark.usefixtures("unused_manifest")
+@pytest.mark.parametrize("stage", ["run", "export"])
+def test_cli_failure_is_reported_and_reraised(tmp_path, monkeypatch, capsys, stage):
+    from backcountry.harness.cli import main
+    report = Report(accepted=[{"region": "example"}])
+    def fail(*args):
+        raise RuntimeError("test validation failure")
+    monkeypatch.setattr("backcountry.harness.loop.JobRunner", lambda *a, **kw: SimpleNamespace(
+        run=fail if stage == "run" else lambda: report, final_ok=True, emit_artifact=fail))
+    monkeypatch.setattr("backcountry.harness.judge.agent.CliJudge.check_available", lambda self: None)
+    with pytest.raises(RuntimeError, match="test validation failure"):
+        main(["run", "unused.yaml", "--work-dir", str(tmp_path / "work"), "--judge", "claude-cli"])
+    captured = capsys.readouterr()
+    assert "job failed:" in captured.err
+    assert "job complete:" not in captured.out
+
+
+@pytest.mark.parametrize("kind,label", [
+    ("repeated_forward", "20 repeated forward passes"),
+    ("advancing_cache_fixed_tokens", "20 steps with advancing cache and fixed input tokens"),
+    ("library_generation", "20 generated tokens via library inference"),
+])
+def test_cli_sequence_label_matches_measurement(kind, label, capsys):
+    from backcountry.harness.cli import _print_result
+    report = Report(step_ms={"main": {"sequence_speedup": 1.1}}, final={"sequences": {
+        "main": {"workload_kind": kind, "steps": 20,
+                 "candidate_sequence_ms": 90, "baseline_sequence_ms": 100}}})
+    _print_result(report, None)
+    message = capsys.readouterr().out
+    assert label in message
+    if kind == "library_generation":
+        assert "baseline 200.00, optimized 222.22" in message
+        assert "not decode-only throughput" in message
+    else:
+        assert "tokens/sec" not in message
+
+
+def test_cli_generation_clock_is_not_called_forward_pass(capsys):
+    from backcountry.harness.cli import _print_result
+    report = Report(constants={"measurement": {"kind": "library_generation", "generated_tokens": 10}},
+                    step_ms={"main": {"speedup": 1.1, "after": 90, "baseline_at_end": 100,
+                                      "stability": 1}})
+    _print_result(report, None)
+    message = capsys.readouterr().out
+    assert "library generation (10 generated tokens)" in message
+    assert "forward pass" not in message
+
+
+def test_a_region_closed_without_a_win_sends_its_near_copies_back(tmp_path):
+    """Queued regions sharing more than 60% of a closed, unshipped region's
+    ops, priced or not, are marked to wait behind everything not yet tried;
+    a shipped region marks nothing."""
+    from backcountry.harness.loop import RegionRun
+    from backcountry.harness.regions.types import Region, Stretch
+
+    def region(name, start, end):
+        return Region(name, ("mx.exp",) * (end - start + 1), [Stretch("w", start, end, (start,), (end + 1,), ("@0",))])
+
+    runner = bare_runner(tmp_path)
+    runner.candidates = []
+    runner.total_hypotheses = runner.manifest.budget_total = 12  # budget spent: closing stops the search here
+    closed, priced_twin, queued_twin = region("closed", 0, 48), region("priced_twin", 1, 48), region("queued_twin", 0, 40)
+    piece, elsewhere = region("piece", 0, 20), region("elsewhere", 100, 148)
+    runner._search_state = {"ranked": [priced_twin, elsewhere], "shipped": [], "run": None, "accepted_before": 0}
+    runner.pending_regions = [queued_twin, piece]
+    assert runner._close_region(RegionRun(region=closed)) is False
+    assert (priced_twin.demoted, queued_twin.demoted, piece.demoted, elsewhere.demoted) == ("closed", "closed", None, None)
+    row = runner.log.rows()[-1]
+    assert row["kind"] == "similar_demoted" and row["regions"] == 2 and row["shared_ops_over"] == 0.6
+
+    won = RegionRun(region=region("won", 200, 248))
+    won.shipped = SimpleNamespace(kernel_id="won_kernel")
+    near_win = region("near_win", 200, 247)
+    runner._search_state["ranked"].append(near_win)
+    runner._close_region(won)
+    assert near_win.demoted is None
+
+
+def test_a_failed_job_records_where_it_died(tmp_path, monkeypatch):
+    """A Metal error names no call; the log keeps the stack it came through."""
+    runner = bare_runner(tmp_path)
+    runner.tracer = SimpleNamespace(uninstall=lambda: None)
+
+    def capture_at_a_fresh_size():
+        raise RuntimeError("[METAL] Command buffer execution failed: Caused GPU Timeout Error")
+    monkeypatch.setattr(runner, "_run", capture_at_a_fresh_size)
+    with pytest.raises(RuntimeError):
+        runner.run()
+    row = runner.log.rows()[-1]
+    assert row["kind"] == "job_failed" and "capture_at_a_fresh_size" in row["stack"]
+
+
+def test_a_resumed_job_draws_new_holdout_sizes(tmp_path):
+    """Unsaved, each resumed Qwen3.8-27B kernel search checked its next
+    kernel at 84, 329 and 1812 tokens again: sizes the first draw had used."""
+    import backcountry.harness.resume as resume_mod
+    resume_mod.save(SimpleNamespace(work_dir=tmp_path, _holdout_draws=2), "after region 1 attempt 14")
+    assert resume_mod.load(tmp_path)["_holdout_draws"] == 2  # _restore sets every saved name back
+
+
+def test_a_kernel_the_gpu_fails_under_runs_again_once_then_is_dropped(tmp_path, monkeypatch):
+    """A GPU failure is charged to the kernel attempt it came in. The resumed
+    job runs that kernel again without asking the judge; at the second failure
+    it records the kernel failed, charged once, and moves on."""
+    import backcountry.harness.resume as resume_mod
+    from backcountry.harness import cli
+    from backcountry.harness.judge.scripted import ScriptedJudge
+    from backcountry.harness.ladder.gates import LadderResult
+    from tests.test_widening import bare, item, opening, proposal
+    monkeypatch.setattr(cli.os, "execv", lambda exe, argv: None)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.delenv("AUTOTUNE_AUTO_RESUMES", raising=False)
+    (tmp_path / resume_mod.STATE).write_bytes(b"saved")
+    gpu = RuntimeError("[METAL] Command buffer execution failed: Caused GPU Timeout Error")
+    seed = {"queue": [item("h1", "one-dispatch")]}
+
+    def process(script, evaluate=None, promote=None):
+        """One job process from the saved point before the judge's call."""
+        runner = bare(tmp_path, budget=1)
+        runner._resumable, runner._safe_point = True, lambda where: None
+        runner._replay = resume_mod.failed_attempt(tmp_path)  # what _restore reads
+        recorded = []
+        runner._record_attempt = lambda run, *a, outcome=None, **kw: recorded.append((a[4].kernel_id, a[6], outcome))
+        if evaluate:
+            runner._evaluate_kernel = evaluate
+        if promote:
+            runner._bind_and_promote = promote(runner)
+        judge = ScriptedJudge(script)
+        run = opening()
+        try:
+            runner.hypothesis_cycle(run, judge)
+        except RuntimeError as error:
+            cli._auto_resume(error, tmp_path)
+        return runner, judge, run, recorded
+
+    def die(*a, **kw):
+        raise gpu
+
+    def die_in_the_whole_model_check(runner):
+        def promote(*a, **kw):
+            runner._attempt_step("the whole-model check")
+            raise gpu
+        return promote
+
+    _, judge, _, recorded = process([seed, proposal("scaffold", "h1")], evaluate=die)
+    assert [c[0] for c in judge.seen] == ["seed", "next"] and not recorded
+    assert resume_mod.failed_attempt(tmp_path)["deaths"][0]["step"] == "the region checks"
+    # a failure while the job resumes (re-recording the model) is charged to no attempt
+    cli._auto_resume(gpu, tmp_path)
+    assert len(resume_mod.failed_attempt(tmp_path)["deaths"]) == 1
+
+    # the same kernel again, no judge call; it passes the region checks and dies after them
+    tentative = lambda *a, **kw: LadderResult("tentative_ship", None, {}, 1., 2., 1., .01)
+    _, judge, _, recorded = process([seed], evaluate=tentative, promote=die_in_the_whole_model_check)
+    assert [c[0] for c in judge.seen] == ["seed"] and not recorded
+    deaths = resume_mod.failed_attempt(tmp_path)["deaths"]
+    assert [d["step"] for d in deaths] == ["the region checks", "the whole-model check"]
+
+    runner, judge, run, recorded = process([seed], evaluate=lambda *a, **kw: pytest.fail("ran a dropped kernel"))
+    assert [c[0] for c in judge.seen] == ["seed"]
+    (kernel, result, outcome), = recorded
+    assert (kernel, outcome, result.failed_gate) == ("h1", "failed", "job_died")
+    assert "2 times" in result.detail["failures"][0]["detail"]
+    assert runner.total_hypotheses == 1 and run.close_rule == "the region's hypothesis budget is spent"
+    assert not (tmp_path / resume_mod.ATTEMPT).exists()

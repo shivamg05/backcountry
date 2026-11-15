@@ -1,0 +1,205 @@
+"""Chip peaks: bandwidth, per-dtype flops, launch cost. Microbenched, never
+read off a spec sheet.
+
+Law 5: the estimator is the running max over samples spread across the window,
+because throttling, contention, and cold start only push observations down.
+Recalibration may only raise a peak.
+"""
+
+from __future__ import annotations
+
+import re
+import statistics
+import subprocess
+from dataclasses import dataclass, field
+
+import mlx.core as mx
+
+from .session import Session
+
+BANDWIDTH_ELEMENTS = 256 * 1024 * 1024  # fp32: 1 GB, far past any on-chip cache
+BANDWIDTH_READS = 4  # reads per sample: ~40 ms, long enough to hold the GPU clock up
+MATMUL_N = 4096  # 2048 reads about 5% under the chip's best rate, 1024 a quarter of it
+LAUNCH_CHAIN = 256
+FALLBACK_LAUNCH_US = 4.0
+
+
+@dataclass(frozen=True)
+class Peaks:
+    bandwidth_gbps: float
+    flops_gflops: dict[str, float] = field(default_factory=dict)
+    launch_us: float = FALLBACK_LAUNCH_US
+
+
+# floors no Apple-Silicon GPU plausibly sits under (same bounds as the pinned
+# physics test); readings below them mean a degraded machine, not a slow chip
+# (seen live: a GPU reading 10x below its own healthy figure within one boot)
+PLAUSIBLE_MIN_GBPS = 30.0
+PLAUSIBLE_MIN_FP32_GFLOPS = 500.0
+
+
+def best_of(a: Peaks, b: Peaks) -> Peaks:
+    """Two readings of the same chip: throttling, contention, and cold
+    start only push a reading down, so the higher one is the truer peak and
+    the lower launch cost the truer floor."""
+    flops = {d: max(a.flops_gflops.get(d, 0.0), b.flops_gflops.get(d, 0.0))
+             for d in set(a.flops_gflops) | set(b.flops_gflops)}
+    return Peaks(bandwidth_gbps=max(a.bandwidth_gbps, b.bandwidth_gbps),
+                 flops_gflops=flops, launch_us=min(a.launch_us, b.launch_us))
+
+
+_UTILIZATION = re.compile(r'"Device Utilization %"=(\d+)')
+_CORES = re.compile(r'"gpu-core-count" = (\d+)')
+BUSY_GPU_PERCENT = 50.0
+
+
+def gpu_utilization(text: str | None = None) -> float | None:
+    """The IORegistry utilization counter, or None if unavailable.
+
+    This is an observation, not a measure of remaining compute or bandwidth.
+    High readings can coexist with healthy measured throughput.
+    """
+    if text is None:
+        try:
+            text = subprocess.run(["ioreg", "-r", "-c", "IOAccelerator", "-d", "4"],
+                                  capture_output=True, text=True, timeout=10).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+    m = _UTILIZATION.search(text)
+    return float(m.group(1)) if m else None
+
+
+def gpu_core_count(text: str | None = None) -> int | None:
+    """How many GPU cores macOS reports for this chip; None when it cannot be
+    read. A threadgroup runs on one core, so this is the least a launch needs
+    to fill the chip."""
+    if text is None:
+        try:
+            text = subprocess.run(["ioreg", "-r", "-c", "IOAccelerator", "-d", "1"],
+                                  capture_output=True, text=True, timeout=10).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+    m = _CORES.search(text)
+    return int(m.group(1)) if m else None
+
+
+def gpu_facts(name: str | None = None) -> dict:
+    """What a kernel author needs beyond the measured peaks, by chip
+    generation ("Apple M4" -> 4). The limits are Metal's for every Apple
+    silicon GPU and were read off an M4's device; the two access costs were
+    microbenched on an M4 (2026-10-06); the M1/M2 register file is from
+    reverse engineering (github.com/philipturner/metal-benchmarks). Checked
+    against Apple's feature tables and the MSL spec 2026-10-16."""
+    name = name or mx.device_info().get("device_name", "")
+    m = re.search(r"\bM(\d+)", name)
+    generation = int(m.group(1)) if m else None
+    facts = {
+        "simd_width": 32,
+        "max_threads_per_threadgroup": 1024,
+        "threadgroup_memory_bytes": 32768,
+        "matrix_unit": "simdgroup_matrix 8x8 (half and float; bfloat needs Metal 3.1); no dedicated "
+                       "matrix unit documented",
+        "on_chip_memory": "about 208 KB of registers per core (reverse-engineered on M1/M2); a kernel's "
+                          "register use sets how many threads stay resident",
+        "threadgroup_memory_access": "a SIMD group reading floats 32 apart took 4.6x as long "
+                                     "as reading consecutive ones (measured on an M4)",
+        "barriers": "a threadgroup barrier after every threadgroup-memory load took 1.5x as long as the "
+                    "load itself (measured on an M4): barriers are not free",
+    }
+    if generation is not None and generation >= 3:
+        facts["on_chip_memory"] = ("registers, threadgroup memory and cache share each core's on-chip "
+                                   "memory dynamically: a kernel's actual register and threadgroup-memory "
+                                   "use sets how many threads stay resident")
+    if generation is not None and generation >= 5:
+        facts["matrix_unit"] = ("simdgroup_matrix 8x8 (half and float; bfloat needs Metal 3.1), plus a "
+                                "neural accelerator in each core (Metal 4 tensor operations)")
+    return facts
+
+
+def implausible(peaks: Peaks) -> str | None:
+    """A one-line reason these peaks cannot be a healthy machine, else None."""
+    if peaks.bandwidth_gbps < PLAUSIBLE_MIN_GBPS:
+        return (f"measured bandwidth {peaks.bandwidth_gbps:.1f} GB/s is below any "
+                f"plausible Apple-Silicon figure (floor {PLAUSIBLE_MIN_GBPS:.0f})")
+    fp32 = peaks.flops_gflops.get("float32")
+    if fp32 is not None and fp32 < PLAUSIBLE_MIN_FP32_GFLOPS:
+        return (f"measured fp32 {fp32:.0f} GFLOP/s is below any plausible "
+                f"Apple-Silicon figure (floor {PLAUSIBLE_MIN_FP32_GFLOPS:.0f})")
+    return None
+
+
+def measure_bandwidth(session: Session, samples: int = 6) -> float:
+    """Read bandwidth: a model step's traffic is almost all reads (weights,
+    cache, inputs), and an M4 reads about 15% faster than it reads and writes
+    together, so a read+write probe put every memory floor 15% too high.
+    Each sample chains several full reads so a short call after cooling
+    cannot read the GPU at a lowered clock."""
+    x = mx.random.normal((BANDWIDTH_ELEMENTS,))
+    mx.eval(x)
+    bytes_moved = BANDWIDTH_READS * 4 * BANDWIDTH_ELEMENTS
+
+    def fn():
+        total = x.sum()
+        for _ in range(BANDWIDTH_READS - 1):
+            total = x.sum() + total * 0
+        return total
+
+    session.warm_until_stable(fn)
+    peak = 0.0
+    for _ in range(samples):
+        session.fresh_chunk(fn)
+        t = session.timed(fn)
+        peak = max(peak, bytes_moved / t / 1e9)
+    session.settle()
+    session.log("peak_bandwidth", gbps=round(peak, 1))
+    return peak
+
+
+def measure_flops(session: Session, dtype: mx.Dtype, samples: int = 6, n: int = MATMUL_N) -> float:
+    a = mx.random.normal((n, n)).astype(dtype)
+    b = mx.random.normal((n, n)).astype(dtype)
+    mx.eval(a, b)
+    flops = 2 * n * n * n
+    fn = lambda: a @ b
+    session.warm_until_stable(fn)
+    peak = 0.0
+    for _ in range(samples):
+        session.fresh_chunk(fn)
+        t = session.timed(fn)
+        peak = max(peak, flops / t / 1e9)
+    session.settle()
+    session.log("peak_flops", dtype=str(dtype), gflops=round(peak, 1))
+    return peak
+
+
+def measure_launch_us(session: Session, chain: int = LAUNCH_CHAIN, samples: int = 5) -> float:
+    """Per-kernel dispatch cost from a chain of dependent tiny ops. Each op is
+    one kernel; the dependency chain stops anything overlapping. Median here,
+    not max: launch cost feeds T_launch as a typical cost, not a capability."""
+    x = mx.array([1.0])
+    mx.eval(x)
+
+    def fn():
+        y = x
+        for _ in range(chain):
+            y = y + 1.0
+        return y
+
+    session.warm_until_stable(fn)
+    times = []
+    for _ in range(samples):
+        session.fresh_chunk(fn)
+        times.append(session.timed(fn))
+    session.settle()
+    per_launch = statistics.median(times) / chain * 1e6
+    session.log("peak_launch", us=round(per_launch, 2))
+    return per_launch
+
+
+def measure_peaks(session: Session, dtypes: tuple[mx.Dtype, ...] = (mx.float32, mx.float16, mx.bfloat16)) -> Peaks:
+    """Job-start calibration. Flops peaks are per dtype present in the trace;
+    the caller passes the dtypes it actually saw."""
+    bandwidth = measure_bandwidth(session)
+    flops = {str(d).removeprefix("mlx.core."): measure_flops(session, d) for d in dtypes}
+    launch = measure_launch_us(session)
+    return Peaks(bandwidth_gbps=bandwidth, flops_gflops=flops, launch_us=launch)

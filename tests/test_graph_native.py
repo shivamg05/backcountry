@@ -1,0 +1,342 @@
+"""Native graph substitution preserves value flow, including live side outputs."""
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import sysconfig
+
+import mlx.core as mx
+import pytest
+
+from backcountry_runtime import graph_native as graph
+
+
+def arrays(shape=(2, 3), dtype=mx.float32):
+    return [mx.array([[1, 2, 3], [4, 5, 6]], dtype).reshape(shape),
+            mx.array([[6, 5, 4], [3, 2, 1]], dtype).reshape(shape)]
+
+
+def equal(actual, expected):
+    mx.eval(actual, expected)
+    for a, b in zip(actual, expected):
+        assert mx.array_equal(a, b).item()
+
+
+def test_replaces_fusion_and_preserves_internal_outside_consumer():
+    p, q = arrays()
+    pattern = mx.exp(p + q)
+    x, y = arrays()
+    shared = x + y
+    roots = [mx.exp(shared), shared * x]
+    result, hits = graph.rewrite(roots, [pattern], [p, q], lambda a: [mx.exp(a[0] + a[1])])
+    assert hits == 1
+    assert graph.array_id(result[1]) == graph.array_id(roots[1])
+    # The external consumer still needs the original shared addition. The
+    # replacement has its own addition, so operation sharing correctly differs.
+    assert not graph.same_structure(roots, result)[0]
+    equal(result, roots)
+
+
+def test_replaces_multiple_separate_boundary_outputs_together():
+    p, q = arrays()
+    patterns = [mx.exp(p + q), p * q]
+    x, y = arrays()
+    first, second = mx.exp(x + y), x * y
+    roots = [first + second, first, second]
+    calls = []
+
+    def replacement(a):
+        calls.append(a)
+        return [mx.exp(a[0] + a[1]), a[0] * a[1]]
+
+    result, hits = graph.rewrite(roots, patterns, [p, q], replacement)
+    assert hits == len(calls) == 1
+    assert graph.same_structure(roots, result)[0]
+    equal(result, roots)
+
+
+def test_boundary_output_with_additional_independent_input():
+    p, q = arrays()
+    r = mx.array([2.0, 3.0, 4.0])
+    x, y = arrays()
+    z = mx.array([8.0, 9.0, 10.0])
+    result, hits = graph.rewrite([x + y, (x + y) * z], [p + q, (p + q) * r], [p, q, r],
+                                lambda a: [a[0] + a[1], (a[0] + a[1]) * a[2]])
+    assert hits == 1
+    equal(result, [x + y, (x + y) * z])
+
+
+def test_live_intermediate_is_also_a_boundary_output():
+    p, q = arrays()
+    intermediate = p + q
+    x, y = arrays()
+    original = x + y
+    result, hits = graph.rewrite([original, mx.exp(original)], [intermediate, mx.exp(intermediate)],
+                                [p, q], lambda a: [a[0] + a[1], mx.exp(a[0] + a[1])])
+    assert hits == 1
+    equal(result, [original, mx.exp(original)])
+
+
+@pytest.mark.parametrize("kind", ["shape", "dtype", "operator", "axis", "stream", "alias", "scalar"])
+def test_nonmatching_case_is_untouched(kind):
+    p, q = arrays()
+    x, y = arrays()
+    pattern, value, parameters = p + q, x + y, [p, q]
+    if kind == "shape":
+        value = x.T + y.T
+    elif kind == "dtype":
+        value = x.astype(mx.float16) + y.astype(mx.float16)
+    elif kind == "operator":
+        value = x - y
+    elif kind == "axis":
+        pattern, value = mx.sum(p, axis=0), mx.sum(x.T, axis=1)
+        parameters = [p]
+    elif kind == "stream":
+        with mx.stream(mx.new_stream(mx.gpu)):
+            value = x + y
+    elif kind == "alias":
+        pattern, parameters = p + p, [p]
+    elif kind == "scalar":
+        pattern, value, parameters = p + 1, x + 2, [p]
+    result, hits = graph.rewrite([value], [pattern], parameters, lambda _: pytest.fail("unexpected match"))
+    assert hits == 0
+    assert graph.array_id(result[0]) == graph.array_id(value)
+
+
+def test_scalar_constants_match_without_becoming_wildcards():
+    p, _ = arrays()
+    x, _ = arrays()
+    roots = [x + 1, x + 2]
+    result, hits = graph.rewrite(roots, [p + 1], [p], lambda a: [a[0] + 1])
+    assert hits == 1
+    equal(result, roots)
+
+
+def test_evaluated_roots_are_never_rewritten():
+    p, q = arrays()
+    x, y = arrays()
+    root = x + y
+    mx.eval(root)
+    result, hits = graph.rewrite([root], [p + q], [p, q], lambda _: pytest.fail("evaluated match"))
+    assert hits == 0
+    assert graph.array_id(result[0]) == graph.array_id(root)
+
+
+def test_callback_can_decline_specific_live_inputs():
+    p, q = arrays()
+    x, y = arrays()
+    other, _ = arrays()
+    roots = [x + y, other + y]
+    seen = []
+
+    def replacement(a):
+        seen.append(graph.array_id(a[0]))
+        return [a[0] + a[1]] if graph.array_id(a[0]) == graph.array_id(x) else None
+
+    result, hits = graph.rewrite(roots, [p + q], [p, q], replacement)
+    assert hits == 1
+    assert len(seen) == 2
+    assert graph.array_id(result[1]) == graph.array_id(roots[1])
+    equal(result, roots)
+
+
+def test_downstream_multioutput_primitive_keeps_every_sibling():
+    p, q = arrays(shape=(3, 2))
+    x, y = arrays(shape=(3, 2))
+    roots = list(mx.linalg.qr(x + y, stream=mx.cpu))
+    result, hits = graph.rewrite(roots, [p + q], [p, q], lambda a: [a[0] + a[1]])
+    assert hits == 1
+    assert graph.same_structure(roots, result)[0]
+    equal(result, roots)
+
+
+def custom_pair(name="graph_pair", add=1):
+    kernel = mx.fast.metal_kernel(name=name, input_names=["x"], output_names=["a", "b"],
+                                 source=f"uint i = thread_position_in_grid.x; a[i] = x[i] + {add}; b[i] = x[i] * 2;")
+
+    def call(x):
+        return kernel(inputs=[x], output_shapes=[x.shape, x.shape], output_dtypes=[x.dtype, x.dtype],
+                      grid=(x.size, 1, 1), threadgroup=(32, 1, 1))
+    return call
+
+
+def test_custom_kernel_multioutput_replacement_and_neighbor():
+    call = custom_pair()
+    p = mx.array([1.0, 2.0, 3.0])
+    x = mx.array([4.0, 5.0, 6.0])
+    patterns, original = call(p), call(x)
+    roots = [original[0] + original[1], original[1]]
+    result, hits = graph.rewrite(roots, patterns, [p], lambda a: [a[0] + 1, a[0] * 2])
+    assert hits == 1
+    equal(result, roots)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_replacing_one_sibling_does_not_depend_on_root_order(reverse):
+    call = custom_pair()
+    p = mx.array([1.0, 2.0, 3.0])
+    x = mx.array([4.0, 5.0, 6.0])
+    patterns, original = call(p), call(x)
+    roots = original[::-1] if reverse else original
+    result, hits = graph.rewrite(roots, [patterns[0]], [p], lambda a: [a[0] + 1])
+    assert hits == 1
+    equal(result, roots)
+
+
+def test_custom_source_change_and_separate_siblings_do_not_match():
+    call, different = custom_pair(), custom_pair(add=3)
+    p = mx.array([1.0, 2.0, 3.0])
+    x = mx.array([4.0, 5.0, 6.0])
+    patterns = call(p)
+    for roots in [different(x), [call(x)[0], different(x)[1]]]:
+        _, hits = graph.rewrite(roots, patterns, [p], lambda _: pytest.fail("different custom source"))
+        assert hits == 0
+
+
+@pytest.mark.parametrize("bad", ["count", "shape", "dtype"])
+def test_invalid_callback_outputs_fail_before_execution(bad):
+    p, q = arrays()
+    x, y = arrays()
+    def replacement(a):
+        return [] if bad == "count" else [a[0].T if bad == "shape" else a[0].astype(mx.float16)]
+    with pytest.raises(ValueError, match="output"):
+        graph.rewrite([x + y], [p + q], [p, q], replacement)
+
+
+def test_compilation_rewrites_once_and_accepts_fresh_input_values():
+    p, q = arrays()
+    pattern = mx.exp(p + q)
+    calls = []
+    @mx.compile
+    def run(x, y):
+        roots, hits = graph.rewrite([mx.exp(x + y)], [pattern], [p, q], lambda a: [mx.exp(a[0] + a[1])])
+        calls.append(hits)
+        return roots[0]
+    x, y = arrays()
+    for i in range(4):
+        equal([run(x + i, y)], [mx.exp(x + i + y)])
+    assert calls == [1]
+
+
+def test_the_package_ships_the_extension_built_for_each_mlx_library_and_python():
+    # installing needs no compiler; after editing graph_native.cpp or
+    # CMakeLists.txt, or widening requires-python, run tools/build_graph_native.py
+    import re
+    import tomllib
+    root = Path(__file__).parents[1]
+    prebuilt = Path(graph.__file__).parent / "prebuilt"
+    lock = tomllib.loads((root / "uv.lock").read_text())
+    metal = next(p for p in lock["package"] if p["name"] == "mlx-metal" and p["version"] == "0.32.4")
+    tags = {"-".join(w["url"].rsplit("/", 1)[1][:-4].split("-")[2:]) for w in metal["wheels"]}
+    supported = tomllib.loads((root / "pyproject.toml").read_text())["project"]["requires-python"]
+    low, high = (int(minor) for minor in re.fullmatch(r">=3\.(\d+),<3\.(\d+)", supported).groups())
+    pythons = {f"cpython-3{minor}" for minor in range(low, high)}
+    assert {folder.name for folder in prebuilt.iterdir()} == tags
+    for tag in tags:
+        assert {folder.name for folder in (prebuilt / tag).iterdir()} == pythons
+        assert json.loads((prebuilt / tag / sys.implementation.cache_tag / "build.json").read_text()) == graph._identity(tag)
+    filename = f"_graph_native{sysconfig.get_config_var('EXT_SUFFIX')}"
+    assert graph.prepare() == prebuilt / graph._library_tag() / sys.implementation.cache_tag / filename
+
+
+def exported(tmp_path):
+    """The extension as a bundle carries it: the source and one binary at the root."""
+    package = tmp_path / "graph_native"
+    shutil.copytree(Path(graph.__file__).parent, package, ignore=shutil.ignore_patterns("__pycache__", "prebuilt"))
+    graph.prepare(package)
+    return package
+
+
+def test_a_binary_built_for_another_mlx_library_is_built_again(tmp_path):
+    # MLX ships a library per macOS release; a binary is never loaded into another
+    package = exported(tmp_path)
+    stamp = package / "build.json"
+    other = "py3-none-macosx_14_0_arm64" if graph._library_tag() != "py3-none-macosx_14_0_arm64" else "py3-none-macosx_15_0_arm64"
+    stamp.write_text(json.dumps({**json.loads(stamp.read_text()), "mlx_library": other}))
+    program = "import graph_native as g; import mlx.core as m; print(g.prepare()); assert g.array_id(m.array([1]))>0"
+    result = subprocess.run([sys.executable, "-c", program], cwd=tmp_path, text=True, capture_output=True,
+                            env={**os.environ, "XDG_CACHE_HOME": str(tmp_path / "cache")})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().startswith(str(tmp_path / "cache"))
+
+
+def test_a_newer_mlx_than_the_shipped_binary_gets_one_built_and_checked(tmp_path):
+    # backcountry follows the newest MLX: the package refused any MLX but
+    # 0.32.4. Another version now builds its own binary on first use, and the
+    # loaded extension must take that MLX's arrays
+    program = ("import importlib.metadata as md; real = md.version\n"
+               "md.version = lambda name: '9.9.9' if name == 'mlx' else real(name)\n"
+               "from backcountry_runtime import graph_native as g; import mlx.core as m\n"
+               "print(g.prepare()); assert g.array_id(m.array([1])) > 0")
+    result = subprocess.run([sys.executable, "-c", program], cwd=tmp_path, text=True, capture_output=True,
+                            env={**os.environ, "XDG_CACHE_HOME": str(tmp_path / "cache")})
+    assert result.returncode == 0, result.stderr
+    built = Path(result.stdout.strip())
+    assert built.is_relative_to(tmp_path / "cache") and json.loads((built.parent / "build.json").read_text())["mlx"] == "9.9.9"
+
+
+def test_exported_extension_loads_in_fresh_process(tmp_path):
+    package = exported(tmp_path)
+    program = "import graph_native as g; import mlx.core as m; x=m.array([1]); assert g.array_id(x)>0"
+    result = subprocess.run([sys.executable, "-c", program], cwd=tmp_path, text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+    stamp = package / "build.json"
+    identity = json.loads(stamp.read_text())
+    identity["mlx"] = "incompatible"
+    stamp.write_text(json.dumps(identity))
+    result = subprocess.run([sys.executable, "-c", program], cwd=tmp_path, text=True, capture_output=True)
+    assert result.returncode != 0
+    assert "does not match" in result.stderr
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_parallel_projections_match_weight_anchors(quantized, reverse):
+    x = mx.ones((1, 8, 64))
+    if quantized:
+        weights = [list(mx.quantize(mx.full((16, 64), v), group_size=64, bits=4))
+                   for v in (1., 2., 3.)]
+        def project(a, w):
+            return mx.quantized_matmul(a, *w, group_size=64, bits=4)
+    else:
+        weights = [[mx.full((64, 16), v)] for v in (1., 2., 3.)]
+        def project(a, w):
+            return a @ w[0]
+    width = len(weights[0])
+    actual = [x, *weights[0], *weights[1]]
+    parameters = [mx.zeros(a.shape, a.dtype) for a in actual]
+    def pair(a):
+        return [project(a[0], a[1:1 + width]), project(a[0], a[1 + width:])]
+    first, second = pair(actual)
+    roots = [first, project(x, weights[2]), second, first + second]
+    if reverse:
+        roots.reverse()
+    calls = []
+    def replace(a):
+        calls.append(a)
+        return pair(a)
+    result, hits = graph.rewrite(roots, pair(parameters), parameters, replace,
+                                 anchors=[None, *actual[1:]])
+    assert hits == len(calls) == 1
+    assert [graph.array_id(a) for a in calls[0]] == [graph.array_id(a) for a in actual]
+    equal(result, roots)
+
+
+def test_parallel_pattern_cannot_use_one_operation_twice():
+    p, q = arrays()
+    x, y = arrays()
+    result, hits = graph.rewrite([x + y], [p + q, p + q], [p, q],
+                                 lambda a: [a[0] + a[1], a[0] + a[1]])
+    assert hits == 0
+    equal(result, [x + y])
+
+
+def test_anchored_boundary_parameters_can_alias():
+    p, q = arrays()
+    x, _ = arrays()
+    result, hits = graph.rewrite([x + x], [p + q], [p, q],
+                                 lambda a: [a[0] + a[1]], anchors=[x, x])
+    assert hits == 1
+    equal(result, [x + x])

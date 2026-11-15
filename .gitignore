@@ -1,0 +1,12 @@
+# run folders and generated results stay out of the tree
+/runs/
+/dist/
+# python and tooling
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+# machine-local agent settings
+/.claude/
+.DS_Store

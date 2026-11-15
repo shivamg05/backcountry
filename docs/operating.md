@@ -1,0 +1,229 @@
+# Operating a run for someone else
+
+## For an AI agent operating this run
+
+These rules apply to operating a job. An explicit request to debug or improve
+the tool authorizes development and testing as well.
+Follow the numbered steps in [the usage guide](usage.md) in order and do nothing outside them. These rules
+bind as much as the steps.
+
+- **Assume the repo is healthy. Do not run the test suite, any single test,
+  diagnostics, or timing scripts of your own.** They take minutes and, worse,
+  they load the GPU, and a busy GPU throttles the chip this job must measure
+  honestly, which hides real wins. Before and during a run, the only thing
+  that should touch the GPU is the run itself.
+- **The whole flow is the numbered steps.** Confirm the manifest names the
+  model and input shapes you mean (usage guide section 2), start the run
+  (usage guide section 3), then watch it and report back
+  ([section 7 below](#7-how-to-talk-to-the-person)). A ready-made manifest
+  such as `manifest.yaml` needs only usage guide section 3 and section 7 below.
+  Do not invent a different sequence.
+- **Do not edit the tool to make a run work.** If the job refuses to start,
+  the message names the fix, which may involve the manifest, model file,
+  or judge login/configuration. If the tool itself crashes or hangs, that is a bug:
+  capture the logs (see the usage guide's [troubleshooting](usage.md#troubleshooting))
+  and hand them to the maintainer; never patch it
+  and rerun.
+- **Files you may create or edit:** a model file in the project, a manifest
+  (a `*.yaml` file), and your own `--work-dir` (the run creates it; you only
+  read what lands there).
+- **Files you must never edit:** the tool itself, in `src/backcountry/harness/` and
+  `src/backcountry_runtime/`; the tests in `tests/`; and this guide.
+
+## 7. How to talk to the person
+
+### Required milestone monitoring
+
+When operating for a person, start a read-only background watcher as soon as
+the job launches (usage guide section 3). Use the session's existing process/wait facilities;
+no installed service or separate optimization process is needed. Watching is
+part of running the job, not something to wait for the person to request.
+
+- Follow this run's `run.jsonl` from the beginning, keeping a byte offset or
+  line cursor. The file may not exist yet at startup. Read only complete JSON
+  lines; leave a partial last line for the next read.
+- The watcher must return or notify the operating agent as soon as any trigger
+  below appears, or the optimizer process exits. Do not wait for several
+  attempts to finish or use a fixed multi-minute reporting delay.
+- Handle all unseen milestones in order, then resume watching from the saved
+  cursor. Do not repeatedly announce old wins. Related events from the same
+  failed attempt may share one update; distinct accepted wins must all be reported.
+- Watch process exit independently of the log. A startup failure or killed
+  process may never write `job_failed`. On exit, drain remaining complete lines
+  and inspect the exit status, console output and `report.json` before reporting.
+  Keep watching through export until the optimizer exits, even after a win or
+  `artifact_checked` event.
+- If the session cannot deliver background notifications, use bounded foreground
+  waits that return on a matching event or process exit, then resume them.
+  Do not promise automatic check-ins that the session cannot actually deliver.
+
+| trigger in `run.jsonl` | required update to the person |
+|---|---|
+| `step_clock` with `phase: before` | Name the model and workload from the manifest, input size and cache context where applicable, baseline mode, and measured `median_ms` per call. Include any recorded measurement caveat; do not wait for calibration or pricing to finish. |
+| `region_open` | Say that a new spot is starting. Explain its `ops` in plain language, give `copies`, its combined latency share `p` for each workload, and the per-region and total attempt limits from `job`. Use known module locations if available; do not guess the model block from a fingerprint. |
+| `shipped` | Always announce the accepted win. Explain the change using its matching hypothesis/candidate record, give the measured whole-model improvement versus the previous installed version, and the correctness rule used. Link its `checkpoint` and say final validation/export are still pending. |
+| `scaffold_failed`, `scaffold_fix`, `scaffold_reference_fallback`, `scaffold_model_fallback`, `bind_failed`, `certification_failed`, `rollback_error`, `plan_refused`, `verdict` with a failed/rolled_back outcome, or `judge` with `action: error`/`babble` | Explain the failure or recovery and what the recorded next action is: repair, another candidate, region skip, or job stop. If the next action is not known yet, say so. Report recovery when a later event establishes it. A correct-but-slower or inconclusive timing result is not an internal error. |
+| `env_warning`, `memory_warning` | Explain the observed condition and its possible effect on this run. Do not claim that measurements are invalid, or that recovery happened, without evidence. |
+| `region_closed` or `region_skip` | State why the spot finished or was skipped, attempts used when recorded, and whether it contributed an accepted improvement. This can share the next region's opening update. |
+| `stage` or `search_finish_requested` | Name the phase now starting and what it does. When search ends, say which validation or packaging step remains. An accepted checkpoint is not yet the finished artifact. |
+| `paused` | Report why it paused, what has been accepted so far, and the `backcountry resume` command. For an unreachable judge, include the judge's error. |
+| `sequence_comparison`, `artifact_checked`, `job_failed`, or optimizer process exit | Report the measured consecutive-step result when available. Announce a finished bundle only after successful export and validation; confirm process exit and final report status. For failure, name the stage/reason, preserved checkpoints and missing final checks; for a GPU timeout, also give the last `memory` line's in-use, peak and limit. A successful no-win run has a report and no artifact. |
+
+In `run.jsonl`, the event name is the **`kind`** field, for example
+`{"kind": "shipped", "kernel": "...", ...}`. Do not filter on `event`;
+that field belongs to `judge.jsonl`. Before leaving the watcher running,
+check that it recognizes an existing event and retains its read position.
+
+Read `run.jsonl` first. Use `report.json` for full checks and timing details,
+`candidates.log` or `judge.jsonl` for the matching optimization idea, and
+`session.jsonl` to explain a cooling pause. Its `step_clock` event and stdout
+report completed samples before cooling; do not describe that pause as waiting
+to take those samples. Read the new log entries before
+answering a manual status question, then continue watching. Normal slower
+attempts and unchanged cooling/judge waits do not require repetitive updates.
+Never invent a finish time. If a win's matching idea has not been written yet,
+announce the measured win first and add the explanation when available.
+
+### Explain the evidence simply
+
+Keep milestone updates to one to three plain sentences. Lead with what happened,
+then the numbers or explanation needed to understand it and what happens next.
+Translate internal names instead of pasting log lines. Define an unfamiliar
+operation the first time it appears. Exact wording is flexible; the milestones
+and required facts above are not.
+
+- Region timings nominate a candidate; they do not establish a model speedup.
+  `shipped.timings` contains repeated whole-model measurements. Use
+  `model_latency_reduction_pct`, or `100 * (1 - timings[workload].median_ratio)`,
+  for the percentage reduction in latency. A speedup ratio of 1.10x means about
+  9.1% less time, not 10% less time.
+- The first accepted win compares with the original model; later wins compare
+  with the previously installed version. Do not add their percentages.
+  `model_ratios` gives an estimated cumulative result for each workload. The
+  legacy `model_ratio` is populated only for a single-workload job. Neither is
+  the final direct comparison; never present the first workload as the whole job.
+- An edit must improve its nominated `target_workload` in both the initial
+  whole-model comparison and fresh confirmation, with no resolved slowdown on
+  any other declared performance workload. Other workloads may be inconclusive.
+  Gains are not averaged across shapes. Name the workloads that improved and
+  distinguish unresolved measurements from proof that performance is unchanged.
+  Final validation requires at least one resolved win and no resolved losses.
+- For library generation, report baseline and optimized generated tokens/sec
+  alongside speedup. Use the final sequence's `baseline_tokens_per_second` and
+  `candidate_tokens_per_second`; these include prompt processing and are not
+  decode-only throughput. Do not infer token counts from arbitrary workload names.
+- The final consecutive-step comparison measures the original against all edits
+  together. Give the recorded number of steps and both total latencies. If you
+  quote per-step averages, label them as averages. Keep this distinct from a
+  single-forward measurement and from full text/image generation.
+- Correctness passing does not automatically mean bit-identical outputs. Read
+  the checks to distinguish exact agreement from agreement within tolerance.
+  A tolerance-based check with zero observed error is still a tolerance-based
+  guarantee. Estimated headroom is a ranking aid, not a guaranteed physical ceiling.
+- A starter failure can lead to a repair or fallback. Do not announce a skip
+  until `region_skip` or `region_closed` establishes it. A later crash does not
+  erase earlier completed model measurements, but can leave final validation
+  and packaging unfinished.
+
+The final response must stand on its own: the workload tested, the final measured
+result and whether it was confirmed, artifact/report paths, meaningful skips,
+and any unresolved failure or action the person needs to take. If monitoring
+was interrupted, catch up from the cursor and identify the gap instead of
+presenting a delayed update as something that just happened.
+
+### Stop searching and finish the run
+
+When the operator asks to stop spending attempts and benchmark what was found,
+run this in a separate terminal while keeping the optimizer process alive:
+
+```sh
+backcountry finish
+```
+
+The request is checked between attempts and regions. The current judge call,
+candidate evaluation, or preparation phase finishes safely first. No new region
+is opened once the request is seen. The job then runs final correctness and
+performance checks and exports only a confirmed win. Watch for
+`search_finish_requested`, followed by the final timing stages. This command
+writes a request for a running job; it does not restart an exited one (see
+below). Killing the process or pressing Ctrl-C interrupts it instead of
+finalizing it.
+
+### Pause and resume
+
+When the operator needs the Mac (sleep, a restart, other GPU work), pause
+instead of killing the job:
+
+```sh
+backcountry pause
+backcountry resume   # when they are back
+```
+
+The job saves its state after setup, between regions and before every judge
+call. A pause request stops it at the next of those points, after the attempt
+it is on: the process exits with the report's status `paused` and a `paused`
+row naming why. Report that the run is paused, what it has accepted so far,
+and the resume command. Three judge calls in a row without an answer also pause
+the job (`paused`, reason "the judge did not answer"): report the judge's
+error, since the operator has to restore the network or the login before
+resuming. A pause waits for the attempt in progress, which on FLUX took a median of 10
+minutes and up to an hour; if the operator can't wait, Ctrl-C is fine: the
+last save is from before that attempt, so `resume` repeats it. A crash or
+killed process works the same way.
+
+On resume, watch for `stage` rows starting with "resuming", then `resumed`
+(what was restored and reinstalled) and `region_resumed` if it stopped inside a
+region; nothing measured during setup is measured again. `resume` refuses when
+the manifest changed or the recording no longer matches the saved regions, and
+warns when the tool's code changed; report either. Runs from before pause and
+resume existed have no saved state and cannot be resumed.
+
+An inconclusive single-step check now continues to the consecutive-step
+benchmark when correctness and the regression veto pass. Export still requires
+a statistically confirmed consecutive-step win, under the single-step final's
+rule: a difference under 1% of the run counts as neither a win nor a loss, and
+over a range (or several request counts) two of the timed sizes must win. A
+1.5% win at three requests alone once shipped kernels that left LM Studio at
+1.00x at one and two requests.
+
+### Jobs that search the generation loop (`identical: output`)
+
+These jobs run in two stages. The loop search writes to `<work-dir>/run.jsonl`:
+`model_search_probe` (what a call that reads several generated tokens costs
+against one token), one `model_attempt` per loop the judge proposes (its
+verdict and `speedup_vs_best`), and `model_search_done` (`final.ok`, the
+speedup, and the conversation and reply lengths checked). Report each attempt's
+verdict briefly and the final in full. `kernel_manifest` follows: `changed:
+true` means the kernel search is aimed at the calls the winning loop makes.
+The kernel search then runs as its own job in `<work-dir>/kernels/`. Its
+`run.jsonl` carries the kernel events in the table above, including
+`step_floor` (its `room` is the kernel search's headroom). Last, the top-level
+`run.jsonl` shows "timing the loop with the kernels", then export and
+`artifact_checked`.
+
+To stop the kernel search early and still ship the loop, run `backcountry finish
+--work-dir <work-dir>/kernels`. If the kernel search confirms no kernel, or
+the loop with the kernels fails its final, the artifact carries the loop alone
+with its own final (`model_level.kernels_dropped` says why). The loop search
+has no safe points, so a pause or finish request does nothing until the
+kernel search starts, and a job stopped during the loop search starts again.
+A job stopped after it resumes with `backcountry resume`:
+the loop's result is reused, and the kernel search continues from its last
+save (or starts, if it never saved).
+
+### Custom Metal kernels and fusion
+
+Captured custom kernels can be searched individually or inside regions with
+neighboring operations. A mixed region starts from the recorded original
+sequence, including its Metal source and launch settings. That starter may use
+several calls; the judge proposes a replacement kernel for the complete region.
+Only a replacement that passes correctness, installation and whole-model timing
+checks can ship. Untested input signatures fall back to the original module.
+
+Every region uses a measured boundary-data probe as a ranking hint. Known
+operation arithmetic adds a compute estimate; arbitrary Metal arithmetic remains
+unknown. Neither estimate is a guaranteed physical limit or a headroom gate.
+
+Library inference times a completed generation request, including library lookahead
+and synchronization. With one generated token, report request latency; it is not
+a strict first-visible-token timer. Generated tokens/sec includes prompt processing.

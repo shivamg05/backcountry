@@ -1,0 +1,381 @@
+"""Manifest parsing, validation, defaults, and the build() probe."""
+
+import textwrap
+
+import re
+
+import pytest
+
+from backcountry.harness.manifest import (
+    SizeSet,
+    DEFAULT_BUDGET_PER_REGION,
+    DEFAULT_BUDGET_TOTAL,
+    DEFAULT_SWEEP_SIZES,
+    Manifest,
+    ManifestError,
+    check_build,
+    load,
+)
+
+
+def write_manifest(tmp_path, body, model_body="def build():\n    return lambda x: x\n"):
+    (tmp_path / "model.py").write_text(model_body)
+    p = tmp_path / "manifest.yaml"
+    p.write_text(textwrap.dedent(body))
+    return p
+
+
+GOOD = """
+model: ./model.py
+model_type: other
+workloads:
+  - inputs: [{shape: [8, L], dtype: int32}]
+    name: midbatch
+  - inputs: [{shape: [1, 1], dtype: int32}]
+    name: decode
+sweep: {L: [1, 7, 512, 4096]}
+"""
+
+
+def test_good_manifest_loads_with_defaults(tmp_path):
+    m = load(write_manifest(tmp_path, GOOD))
+    assert m.model_path == (tmp_path / "model.py").resolve()
+    assert [w.name for w in m.workloads] == ["midbatch", "decode"]
+    assert m.workloads[0].inputs[0].shape == (8, "L")
+    assert m.sweep["L"] == (1, 7, 512, 4096)
+    assert m.primary["L"] == 4096
+    assert m.budget_per_region == DEFAULT_BUDGET_PER_REGION
+    assert m.budget_total == DEFAULT_BUDGET_TOTAL
+    assert m.tolerances is None
+    assert set(m.defaulted) == {"primary.L", "tolerances", "identical", "budget.per_region", "budget.total", "seed",
+                              "baseline", "final_benchmark.steps", "final_benchmark.pairs",
+                              "final_benchmark.warmup_steps", "use_library_inference",
+                              "range"}
+
+
+def test_library_inference_is_an_optional_boolean(tmp_path):
+    manifest = load(write_manifest(tmp_path, GOOD))
+    assert manifest.use_library_inference is None
+    for value in (True, False):
+        manifest = load(write_manifest(tmp_path, GOOD + f"use_library_inference: {str(value).lower()}\n"))
+        assert manifest.use_library_inference is value
+        assert "use_library_inference" not in manifest.defaulted
+
+
+@pytest.mark.parametrize("value", ["null", "1", "0", "'true'", "inference", "[]", "{}"])
+def test_library_inference_rejects_non_booleans(tmp_path, value):
+    with pytest.raises(ManifestError, match="use_library_inference must be true or false"):
+        load(write_manifest(tmp_path, GOOD + f"use_library_inference: {value}\n"))
+
+
+@pytest.mark.parametrize("value", ["null", "moe llm", "LLM", "[llm]"])
+def test_model_type_defaults_to_other_and_must_be_one_of_the_listed_kinds(tmp_path, value):
+    """Left out it is `other` (it only labels the knowledge file's lines); the
+    README's tiny example has none and failed on it from 2026-10-05."""
+    good = GOOD.replace("model_type: other\n", "")
+    assert load(write_manifest(tmp_path, good)).model_type == "other"
+    assert load(write_manifest(tmp_path, good + "model_type: moe-llm\n")).model_type == "moe-llm"
+    with pytest.raises(ManifestError, match="model_type must be one of"):
+        load(write_manifest(tmp_path, good + f"model_type: {value}\n"))
+
+
+def test_final_benchmark_defaults_and_overrides(tmp_path):
+    m = load(write_manifest(tmp_path, GOOD))
+    assert (m.final_benchmark.steps, m.final_benchmark.pairs, m.final_benchmark.warmup_steps) == (10, 4, 3)
+    m = load(write_manifest(tmp_path, GOOD + "final_benchmark: {steps: 50, pairs: 6, warmup_steps: 4}\n"))
+    assert (m.final_benchmark.steps, m.final_benchmark.pairs, m.final_benchmark.warmup_steps) == (50, 6, 4)
+
+
+@pytest.mark.parametrize("config", ["{steps: 0}", "{steps: true}", "{pairs: 2}",
+                                    "{pairs: 5}", "{warmup_steps: 0}", "{unknown: 1}", "[]"])
+def test_invalid_final_benchmark_is_rejected_before_gpu_work(tmp_path, config):
+    with pytest.raises(ManifestError, match="final_benchmark"):
+        load(write_manifest(tmp_path, GOOD + f"final_benchmark: {config}\n"))
+
+
+def test_baseline_defaults_to_compiled_and_accepts_plain(tmp_path):
+    m = load(write_manifest(tmp_path, GOOD))
+    assert m.baseline == "compiled" and "baseline" in m.defaulted
+    m = load(write_manifest(tmp_path, GOOD + "baseline: plain\n"))
+    assert m.baseline == "plain" and "baseline" not in m.defaulted
+    with pytest.raises(ManifestError, match="baseline must be one of"):
+        load(write_manifest(tmp_path, GOOD + "baseline: fastest\n"))
+
+
+def test_primary_override_and_explicit_budget(tmp_path):
+    m = load(write_manifest(tmp_path, GOOD + "primary: {L: 512}\nbudget: {per_region: 5, total: 50}\n"))
+    assert m.primary["L"] == 512
+    assert m.budget_per_region == 5
+    assert m.budget_total == 50
+    assert "primary.L" not in m.defaulted
+
+
+def test_sweep_defaults_when_omitted(tmp_path):
+    body = GOOD.replace("sweep: {L: [1, 7, 512, 4096]}\n", "")
+    m = load(write_manifest(tmp_path, body))
+    assert m.sweep["L"] == DEFAULT_SWEEP_SIZES
+    assert "sweep.L" in m.defaulted
+
+
+def test_tolerances_explicit_and_per_dtype_defaults(tmp_path):
+    m = load(write_manifest(tmp_path, GOOD))
+    assert m.tolerance_for("float16") == (1e-2, 2e-2)
+    m2 = load(write_manifest(tmp_path, GOOD + "tolerances: {rtol: 1.0e-3, atol: 1.0e-4}\n"))
+    assert m2.tolerance_for("float16") == (1e-3, 1e-4)
+    with pytest.raises(ManifestError, match="no tolerance default"):
+        m.tolerance_for("int32")
+
+
+@pytest.mark.parametrize("field", ["rtol", "atol"])
+@pytest.mark.parametrize("value", [".inf", "-.inf", ".nan", "-0.01"])
+def test_invalid_tolerances_cannot_disable_correctness(tmp_path, field, value):
+    values = {"rtol": "0", "atol": "0", field: value}
+    body = GOOD + f"tolerances: {{rtol: {values['rtol']}, atol: {values['atol']}}}\n"
+    with pytest.raises(ManifestError, match="finite and non-negative"):
+        load(write_manifest(tmp_path, body))
+
+
+@pytest.mark.parametrize(
+    "mutation, message",
+    [
+        ({"model": "./missing.py"}, "does not exist"),
+        ({"workloads": []}, "non-empty workloads"),
+        ({"sweep": {"K": [2]}}, "appears in no workload shape"),
+        ({"primary": {"K": 2}}, "appears in no workload shape"),
+        ({"budget": {"per_region": 0}}, "positive integer"),
+        ({"budget": {"per_region": -3}}, "positive integer"),
+        ({"tolerances": {"rtol": 1e-3}}, "rtol, atol"),
+        ({"dtype_policy": "bf16"}, "unknown manifest keys"),
+    ],
+)
+def test_bad_manifests_fail_with_pointed_messages(tmp_path, mutation, message):
+    import yaml
+
+    base = yaml.safe_load(textwrap.dedent(GOOD))
+    base.update(mutation)
+    with pytest.raises(ManifestError, match=message):
+        load(write_manifest(tmp_path, yaml.safe_dump(base)))
+
+
+@pytest.mark.parametrize(
+    "inputs, message",
+    [
+        ("[{shape: 5, dtype: int32}]", "must be a list"),
+        ("[{shape: [0], dtype: int32}]", ">= 1"),
+        ("[{shape: [2], dtype: f16}]", "unknown dtype"),
+        ("[{shape: [2], dtype: float16, low: 0, high: 5}]", "integer dtypes only"),
+        ("[{shape: [2], dtype: int32, low: 5, high: 5}]", "low < high"),
+        ("[{shape: [2], dtype: int32, extra: 1}]", "unknown input keys"),
+        ("[{shape: ['not an ident!'], dtype: int32}]", "identifier"),
+    ],
+)
+def test_bad_inputs_fail(tmp_path, inputs, message):
+    body = f"""
+    model: ./model.py
+    model_type: other
+    workloads:
+      - inputs: {inputs}
+    """
+    with pytest.raises(ManifestError, match=message):
+        load(write_manifest(tmp_path, body))
+
+
+def test_duplicate_workload_names_fail(tmp_path):
+    body = """
+    model: ./model.py
+    model_type: other
+    workloads:
+      - {inputs: [{shape: [2], dtype: int32}], name: a}
+      - {inputs: [{shape: [3], dtype: int32}], name: a}
+    """
+    with pytest.raises(ManifestError, match="unique"):
+        load(write_manifest(tmp_path, body))
+
+
+def test_check_build_passes_on_good_model(tmp_path):
+    m = load(write_manifest(tmp_path, GOOD))
+    check_build(m)
+
+
+def test_check_build_missing_build(tmp_path):
+    m = load(write_manifest(tmp_path, GOOD, model_body="x = 1\n"))
+    with pytest.raises(ManifestError, match="define build\\(\\)"):
+        check_build(m)
+
+
+def test_check_build_required_args(tmp_path):
+    m = load(write_manifest(tmp_path, GOOD, model_body="def build(cfg):\n    return cfg\n"))
+    with pytest.raises(ManifestError, match="no arguments"):
+        check_build(m)
+
+
+def test_check_build_cwd_relative_read(tmp_path):
+    (tmp_path / "weights.bin").write_bytes(b"\0")
+    model_body = 'data = open("weights.bin", "rb").read()\ndef build():\n    return lambda x: x\n'
+    m = load(write_manifest(tmp_path, GOOD, model_body=model_body))
+    with pytest.raises(ManifestError, match="relative to __file__"):
+        check_build(m)
+
+
+def test_manifest_is_frozen(tmp_path):
+    m = load(write_manifest(tmp_path, GOOD))
+    with pytest.raises(AttributeError):
+        m.budget_total = 1
+    with pytest.raises(TypeError):
+        m.sweep["L"] = (2,)
+
+
+def test_a_ship_is_not_a_manifest_knob(tmp_path):
+    """What decides a ship is not configurable: it is always the whole model.
+    A stale ship_on key is rejected like any unknown key."""
+    with pytest.raises(ManifestError, match="unknown"):
+        load(write_manifest(tmp_path, GOOD + "ship_on: model\n"))
+
+
+CONTEXT = """
+model: ./model.py
+model_type: other
+workloads:
+  - inputs: [{shape: [1, 1], dtype: int32}]
+    name: decode
+    context: 512
+"""
+
+
+def test_context_is_the_tokens_already_in_place(tmp_path):
+    m = load(write_manifest(tmp_path, CONTEXT))
+    assert m.workloads[0].context == 512
+    assert load(write_manifest(tmp_path, CONTEXT.replace("512", "0"))).workloads[0].context == 0
+    assert [w.context for w in load(write_manifest(tmp_path, GOOD)).workloads] == [None, None]
+    # a conversation beside a workload without one: a prompt read, then replies
+    mixed = load(write_manifest(tmp_path, CONTEXT + "  - inputs: [{shape: [1, L], dtype: int32}]\n"
+                                                    "    name: prompt\nprimary: {L: 32}\n"))
+    assert [w.context for w in mixed.workloads] == [512, None]
+
+
+@pytest.mark.parametrize("body, message", [
+    (CONTEXT.replace("512", "-1"), "whole number"),
+    (CONTEXT.replace("512", "true"), "whole number"),
+    (CONTEXT.replace("512", "'512'"), "whole number"),
+    (CONTEXT.replace("512", "1.5"), "whole number"),
+    (CONTEXT.replace("[{shape: [1, 1], dtype: int32}]",
+                     "[{shape: [1, 1], dtype: int32}, {shape: [1], dtype: float32}]"), "one input"),
+    (CONTEXT.replace("dtype: int32", "dtype: float16"), "token ids"),
+    (CONTEXT + "  - inputs: [{shape: [1, 1], dtype: int32}]\n    name: other\n    context: 64\n",
+     "one workload with a context"),
+])
+def test_invalid_context_is_rejected_before_gpu_work(tmp_path, body, message):
+    with pytest.raises(ManifestError, match=message):
+        load(write_manifest(tmp_path, body))
+
+
+@pytest.mark.parametrize("field", ["rtol", "atol"])
+def test_boolean_tolerance_is_not_a_number(tmp_path, field):
+    values = {"rtol": "0", "atol": "0", field: "true"}
+    body = GOOD + f"tolerances: {{rtol: {values['rtol']}, atol: {values['atol']}}}\n"
+    with pytest.raises(ManifestError, match="not booleans"):
+        load(write_manifest(tmp_path, body))
+
+
+
+@pytest.mark.parametrize("field", ["rtol", "atol"])
+def test_tolerance_must_fit_the_actual_comparison_dtype(tmp_path, field):
+    values = {"rtol": "0", "atol": "0", field: "1.0e300"}
+    body = GOOD + f"tolerances: {{rtol: {values['rtol']}, atol: {values['atol']}}}\n"
+    with pytest.raises(ManifestError, match="fit in float32"):
+        load(write_manifest(tmp_path, body))
+
+
+def test_check_optimizations_for_names_one_range_and_adds_no_sweep(tmp_path):
+    body = """
+model: ./model.py
+model_type: other
+workloads:
+  - inputs: [{shape: [T, 64], dtype: float32}]
+primary: {T: 1024}
+check_optimizations_for: {T: [256, 4096]}
+"""
+    m = load(write_manifest(tmp_path, body))
+    assert dict(m.serve) == {"T": SizeSet(256, 4096)} and not m.serve_auto
+    assert m.sweep["T"] == (1024,)  # the search is checked at the primary size only, as without it
+
+
+def test_check_optimizations_for_can_be_turned_off_or_left_to_the_tool(tmp_path):
+    body = "model: ./model.py\nmodel_type: other\nworkloads:\n  - inputs: [{shape: [1, 2048], dtype: int32}]\n"
+    assert load(write_manifest(tmp_path, body)).serve_auto
+    off = load(write_manifest(tmp_path, body + "check_optimizations_for: false\n"))
+    assert not off.serve_auto and not off.serve
+
+
+@pytest.mark.parametrize("value, primary, needle", [
+    ("{T: [256, 4096]}", "", "set primary.T"),
+    ("{T: [256]}", "primary: {T: 1024}\n", "must be [smallest, largest]"),
+    ("{T: [256, 257]}", "primary: {T: 1024}\n", "exceed the smallest by at least 2"),
+    ("{U: [2, 8]}", "", "appears in no workload shape"),
+])
+def test_check_optimizations_for_is_validated(tmp_path, value, primary, needle):
+    body = (f"model: ./model.py\nmodel_type: other\nworkloads:\n  - inputs: [{{shape: [T, 64], dtype: float32}}]\n"
+            f"{primary}check_optimizations_for: {value}\n")
+    with pytest.raises(ManifestError, match=re.escape(needle)):
+        load(write_manifest(tmp_path, body))
+
+
+def test_check_optimizations_for_takes_exact_sizes(tmp_path):
+    body = """
+model: ./model.py
+model_type: other
+workloads:
+  - inputs: [{shape: [1, T, 128], dtype: bfloat16}]
+primary: {T: 2304}
+check_optimizations_for: {T: {sizes: [4096, 1024, 3072, 1024]}}
+"""
+    m = load(write_manifest(tmp_path, body))
+    assert m.serve["T"] == SizeSet(1024, 4096, (1024, 3072, 4096))
+    assert m.serve["T"].recordings(2304) == [1024, 3072, 4096] and m.serve["T"].sizes() == (1024, 3072, 4096)
+    with pytest.raises(ManifestError, match="at least three sizes"):
+        load(write_manifest(tmp_path, body.replace("[4096, 1024, 3072, 1024]", "[2304, 1024]")))
+
+
+def test_a_scalar_input_has_an_empty_shape(tmp_path):
+    """A model can take a bare number (a diffusion timestep): shape []."""
+    body = """
+model: ./model.py
+model_type: other
+workloads:
+  - inputs: [{shape: [1, 64, 8], dtype: bfloat16}, {shape: [], dtype: float32}]
+"""
+    m = load(write_manifest(tmp_path, body))
+    assert m.workloads[0].inputs[1].shape == ()
+    from backcountry.harness.workload import materialize
+    assert materialize(m.workloads[0], m.primary, 0)[1].shape == ()
+
+
+def test_the_search_runs_at_one_size_per_bin_across_the_range():
+    """Speed changes over multiples (launch-bound small, compute-bound large),
+    so the bins grow by one factor; the size inside a bin is random, since
+    tile alignment (128 vs 129 rows) is not smooth. The primary keeps its bin."""
+    from backcountry.harness.manifest import SizeSet, search_sizes
+    sizes = search_sizes(SizeSet(32, 2049), 128, seed=7)
+    assert len(sizes) == 10 and 128 in sizes and sizes == tuple(sorted(sizes))
+    assert all(32 <= n <= 2049 for n in sizes)
+    edges = [round(32 * 64.03125 ** (i / 10)) for i in range(10)] + [2050]
+    assert all(sum(a <= n < b for n in sizes) == 1 for a, b in zip(edges, edges[1:]))
+    assert search_sizes(SizeSet(32, 2049), 128, seed=7) == sizes  # seeded: every job the same
+    assert search_sizes(SizeSet(32, 2049), 128, seed=8) != sizes
+    assert search_sizes(SizeSet(1024, 4096, (1024, 3072, 4096)), 2304, seed=7) == (1024, 2304, 3072, 4096)
+    assert len(search_sizes(SizeSet(3, 12), 5, seed=7)) <= 10  # narrow ranges: empty bins are skipped
+
+
+def test_range_names_the_sizes_and_its_earlier_name_still_reads(tmp_path):
+    body = textwrap.dedent("""
+        model: model.py
+        model_type: other
+        workloads:
+          - inputs: [{shape: [T, 8], dtype: float32}]
+        primary: {T: 64}
+        """)
+    new = load(write_manifest(tmp_path, body + "range: {T: [16, 256]}\n"))
+    old = load(write_manifest(tmp_path, body + "check_optimizations_for: {T: [16, 256]}\n"))
+    assert dict(new.serve) == dict(old.serve) == {"T": SizeSet(16, 256)}
+    with pytest.raises(ManifestError, match="not both"):
+        load(write_manifest(tmp_path, body + "range: {T: [16, 256]}\ncheck_optimizations_for: {T: [16, 256]}\n"))

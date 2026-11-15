@@ -1,0 +1,59 @@
+[project]
+name = "backcountry"
+version = "0.1.1"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+description = "Makes MLX models faster on Apple Silicon without changing their answers: an AI proposes Metal kernels and faster loops, and a harness keeps only verified wins"
+authors = [{ name = "Shivam Garg" }]
+requires-python = ">=3.12,<3.15"  # one prebuilt graph binary per version: tools/build_graph_native.py
+keywords = ["mlx", "apple-silicon", "metal", "kernels", "llm", "inference", "optimization"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "mlx>=0.32.4; sys_platform == \"darwin\"",   # the newest MLX, never pinned; macOS only (mflux pins Linux CUDA MLX)
+    "nanobind==3.1.0",
+    "cmake>=3.27",
+    "pyyaml>=6.0",
+    "numpy>=2.0",
+    "anthropic>=0.40",
+]
+
+[dependency-groups]
+dev = [
+    "mlx-lm>=0.31.3",
+    "mlx-vlm>=0.6.17",
+    "pytest>=8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/shivamg05/backcountry"
+Repository = "https://github.com/shivamg05/backcountry"
+Issues = "https://github.com/shivamg05/backcountry/issues"
+
+[project.scripts]
+backcountry = "backcountry.harness.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/backcountry", "src/backcountry_runtime"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/tests", "/docs", "/tools", "/pyproject.toml", "/uv.lock", "/README.md", "/RUNNING.md", "/LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --durations=10"
+markers = [
+    "integration: runs whole jobs or live models; minutes, not seconds. Skip with -m 'not integration'",
+]
